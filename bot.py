@@ -2,11 +2,19 @@
 """
 Chowdeck Multi-Account Promo Sniper - Telegram bot + HTTP bridge receiver.
 
-Features:
-* Full PostgreSQL / Supabase storage backend support via DATABASE_URL, with local JSON file fallback.
-* PROMPT MODE ONLY for security questions with AI web-search assist.
-* Authenticated inbound webhook (POST /tweet and GET /status).
-* Hedged claiming, anti-self-throttle pacing, and background token refresh.
+Rewrite notes
+-------------
+* PROMPT MODE ONLY. The legacy "auto" mode and every stored / pre-configured
+  security answer are gone. When a security-question-enabled code is detected
+  the bot relays the question and captures the user's pasted answer instantly.
+* Code-priority parsing: a pasted promo code is never swallowed as a security
+  answer. Explicit /ans and /code overrides exist for edge cases.
+* Fixed admin check: admins are only admins when ADMIN_CHAT_ID is set AND matches
+  (the old logic granted admin to everyone when the var was missing).
+* Authenticated inbound webhook: POST /tweet and GET /status require
+  WEBHOOK_SECRET (fail closed unless ALLOW_INSECURE_WEBHOOK=true).
+* Low latency: shared keep-alive HTTP clients, in-memory JSON cache with
+  debounced write-behind to disk/PostgreSQL, per-slot result streaming.
 """
 
 import asyncio
@@ -25,14 +33,15 @@ import unicodedata
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-import httpx
-from curl_cffi import requests as cffi_requests
 import psycopg2
 from psycopg2.extras import Json
+import httpx
+from curl_cffi import requests as cffi_requests
 
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHANNEL_ID = os.getenv("TELEGRAM_CHANNEL_ID", "").strip()
 PROXY_URL = os.getenv("PROXY_URL", "").strip() or None
@@ -43,7 +52,6 @@ ALLOW_INSECURE_WEBHOOK = os.getenv("ALLOW_INSECURE_WEBHOOK", "").strip().lower()
 )
 PORT = int(os.getenv("PORT", "8080"))
 OCR_API_KEY = os.getenv("OCR_API_KEY", "helloworld").strip() or "helloworld"
-DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 
 ADMIN_MAX_SLOTS = max(1, int(os.getenv("ADMIN_MAX_SLOTS", "20")))
 USER_MAX_SLOTS = max(1, int(os.getenv("USER_MAX_SLOTS", "10")))
@@ -181,7 +189,7 @@ _IGNORE_TOKENS = {
 }
 
 # ---------------------------------------------------------------------------
-# Database Storage Layer (PostgreSQL / Supabase Switch)
+# In-memory JSON store with debounced write-behind / Supabase fallback
 # ---------------------------------------------------------------------------
 _store_lock = threading.RLock()
 _cache = {}
@@ -197,26 +205,6 @@ def _pg_conn():
     except Exception as e:
         print(f"[db] connection error: {e}", flush=True)
         return None
-
-def init_db():
-    if not DATABASE_URL:
-        return
-    conn = _pg_conn()
-    if conn:
-        try:
-            with conn:
-                with conn.cursor() as cur:
-                    cur.execute("""
-                        CREATE TABLE IF NOT EXISTS bot_storage (
-                            key TEXT PRIMARY KEY,
-                            data JSONB NOT NULL
-                        );
-                    """)
-            print("[db] PostgreSQL storage table ready.", flush=True)
-        except Exception as e:
-            print(f"[db] init error: {e}", flush=True)
-        finally:
-            conn.close()
 
 def _atomic_write(path, data):
     if DATABASE_URL:
@@ -240,7 +228,7 @@ def _atomic_write(path, data):
         with open(tmp, "w") as f:
             json.dump(data, f, indent=2)
         os.replace(tmp, path)
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         print(f"[store] failed to persist {path}: {e}", flush=True)
         try:
             if os.path.exists(tmp):
@@ -267,7 +255,6 @@ def start_store_writer():
         if _writer_started:
             return
         _writer_started = True
-    init_db()
     threading.Thread(target=_writer_loop, name="json-writer", daemon=True).start()
 
 def load_json(file_path):
@@ -293,7 +280,7 @@ def load_json(file_path):
         try:
             with open(file_path, "r") as f:
                 data = json.load(f)
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             print(f"[store] error reading {file_path}: {e}", flush=True)
             data = {}
     if not isinstance(data, dict):
@@ -547,7 +534,7 @@ def parse_and_store_credentials(raw_input, chat_str, slot):
                         if "token" in data:
                             extracted_token = data["token"]
                         extracted_phone = extract_phone_from_data(data)
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             print(f"[creds] cookie parse error: {e}", flush=True)
 
     if cleaned.startswith("{") and "token" in cleaned:
@@ -604,7 +591,7 @@ async def fetch_account_phone(token, cookies):
             if not isinstance(data, dict):
                 data = res_json
             return extract_phone_from_data(data)
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         print(f"[creds] profile fetch error: {e}", flush=True)
     return None
 
@@ -790,7 +777,7 @@ async def _auth_post(path, payload, token=None):
 
         res = await _AUTH_CLIENT.post(target_url, json=payload, headers=headers)
         body = _safe_json(res)
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         return None, {"message": str(e)}
         
     if LOG_RAW_AUTH:
@@ -913,7 +900,7 @@ def clear_login_flow(chat_str):
 def token_exp_ts(token):
     try:
         payload = parse_jwt_payload(token) or {}
-    except Exception:
+    except Exception:  # noqa: BLE001
         return None
     exp = payload.get("exp")
     try:
@@ -1086,7 +1073,7 @@ async def _refresh_worker(chat_str, slot, entry):
     key = (str(chat_str), str(slot))
     try:
         return await refresh_slot_token(chat_str, slot, entry, force=True)
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         print(f"[auth] refresh {chat_str}/{slot} failed: {e}", flush=True)
         return None
     finally:
@@ -1128,7 +1115,7 @@ async def _probe_path(path, token, cookies=None):
             cookies=cookies or None,
             timeout=AUTH_TIMEOUT,
         )
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         return {"path": path, "status": None, "body": {}, "err": str(e)}
     return {"path": path, "status": res.status_code, "body": _safe_json(res), "err": ""}
 
@@ -1227,7 +1214,7 @@ async def check_all_slots(chat_str, concurrency=4):
         async with sem:
             try:
                 return await probe_slot_token(chat_str, sid)
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001
                 return {"slot": sid, "state": "error", "status": None,
                         "entry": {}, "error": str(e)}
 
@@ -1249,7 +1236,7 @@ def format_accounts_health(results, chat_str=None):
         phone = r.get("phone") or ((r.get("entry") or {}).get("phone"))
         label = f"{icon} S{r.get('slot')}"
         if phone:
-            label += f": `{phone}`"
+            label += f"`{phone}`"
         detail = {
             "active": "active",
             "expired": "token expired — sign in again with /login",
@@ -1601,7 +1588,7 @@ _AI_LAST = {"provider": "", "kind": "", "detail": "", "ok": False, "ts": 0.0}
 def _ai_body_snippet(res, limit=160):
     try:
         body = re.sub(r"\s+", " ", str(res.text or "")).strip()
-    except Exception:
+    except Exception:  # noqa: BLE001
         body = ""
     return body[:limit]
 
@@ -1645,7 +1632,7 @@ def _pending_question_open(chat_str, code):
             str((entry or {}).get("code") or "") == str(code)
             for entry in list_pending(str(chat_str))
         )
-    except Exception:
+    except Exception:  # noqa: BLE001
         return True
 
 _AI_FILLER_RE = re.compile(
@@ -1714,7 +1701,7 @@ async def _ai_perplexity(question):
                 }],
             },
         )
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         _ai_note_error("perplexity", type(e).__name__, str(e))
         return []
     if res.status_code != 200:
@@ -1759,7 +1746,7 @@ async def _ai_openai(question):
                 return answers
         else:
             _ai_note_error("openai", f"HTTP {res.status_code}", _ai_body_snippet(res))
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         _ai_note_error("openai", type(e).__name__, str(e))
     try:
         res = await client.post(
@@ -1777,7 +1764,7 @@ async def _ai_openai(question):
                 return _parse_ai_answers((choices[0].get("message") or {}).get("content"))
         else:
             _ai_note_error("openai", f"HTTP {res.status_code}", _ai_body_snippet(res))
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         _ai_note_error("openai", type(e).__name__, str(e))
     return []
 
@@ -1837,7 +1824,7 @@ async def _gemini_discover(client):
             "https://generativelanguage.googleapis.com/v1beta/models",
             headers={"x-goog-api-key": GEMINI_API_KEY},
         )
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         print(f"[ai] gemini model list failed: {type(e).__name__}: {e}", flush=True)
         return []
     if res.status_code != 200:
@@ -1884,7 +1871,7 @@ async def _ai_warm_models():
         return
     try:
         await _gemini_discover(_AI_CLIENT_LATE)
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         print(f"[ai] model warmup failed: {e}", flush=True)
 
 async def _ai_gemini(question):
@@ -1896,7 +1883,7 @@ async def _ai_gemini(question):
             await asyncio.wait_for(
                 _gemini_discover(client), timeout=_AI_MODEL_DISCOVER_TIMEOUT
             )
-        except Exception:
+        except Exception:  # noqa: BLE001
             pass
 
     async def ask(model, with_search):
@@ -1913,7 +1900,7 @@ async def _ai_gemini(question):
                 },
                 json=body,
             )
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             _ai_note_error("gemini", f"{type(e).__name__} on {model}", str(e))
             return "", []
         if res.status_code != 200:
@@ -1983,7 +1970,7 @@ async def _ai_tavily(question):
                 "max_results": 5,
             },
         )
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         _ai_note_error("tavily", type(e).__name__, str(e))
         return []
     if res.status_code != 200:
@@ -2033,7 +2020,7 @@ async def _ai_lookup_once(question, deadline, client):
             return name, await asyncio.wait_for(
                 _ai_with_client(func, client, question), timeout=deadline
             )
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             print(f"[ai] {name} failed: {e}", flush=True)
             return name, []
 
@@ -2178,7 +2165,7 @@ async def assist_security_question(chat_id, chat_str, code, question):
         provider, answers, elapsed = await asyncio.wait_for(
             ai_answer_candidates(question), timeout=AI_DEADLINE + 2.0
         )
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         print(f"[ai] fast pass failed: {e}", flush=True)
     if answers:
         await _ai_post_suggestions(
@@ -2192,7 +2179,7 @@ async def assist_security_question(chat_id, chat_str, code, question):
                 ai_answer_candidates(question, late=True),
                 timeout=AI_LATE_DEADLINE + 2.0,
             )
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             print(f"[ai] late pass failed: {e}", flush=True)
             provider, answers, elapsed = None, [], 0.0
         if answers:
@@ -2234,7 +2221,7 @@ async def send_telegram(chat_id, text, reply_markup=None, parse_mode="Markdown")
                 wait = 1.0
                 try:
                     wait = float(res.json().get("parameters", {}).get("retry_after", 1.0))
-                except Exception:
+                except Exception:  # noqa: BLE001
                     pass
                 if attempt < 2:
                     await asyncio.sleep(min(wait, 5.0) + 0.05)
@@ -2246,7 +2233,7 @@ async def send_telegram(chat_id, text, reply_markup=None, parse_mode="Markdown")
                 payload.pop("parse_mode", None)
                 continue
             return None
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             if attempt < 2:
                 continue
             print(f"[tg] send error to {chat_id}: {e}", flush=True)
@@ -2281,7 +2268,7 @@ async def answer_callback_query(callback_query_id, text=""):
         await _TG_CLIENT.post(
             url, json={"callback_query_id": callback_query_id, "text": text}
         )
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         print(f"[tg] callback answer error: {e}", flush=True)
 
 async def edit_message_text(chat_id, message_id, text, reply_markup=None, parse_mode="Markdown"):
@@ -2305,7 +2292,7 @@ async def edit_message_text(chat_id, message_id, text, reply_markup=None, parse_
                 payload.pop("parse_mode", None)
                 continue
             return
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             if attempt == 0:
                 continue
             print(f"[tg] edit error: {e}", flush=True)
@@ -2322,7 +2309,7 @@ async def perform_ocr_on_image(image_bytes):
             parsed = res.json().get("ParsedResults", [])
             if parsed:
                 return parsed[0].get("ParsedText", "")
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         print(f"[ocr] error: {e}", flush=True)
     return ""
 
@@ -2448,7 +2435,7 @@ def _retry_after_seconds(res, default=1.0):
                 when = when.replace(tzinfo=datetime.timezone.utc)
             delta = (when - datetime.datetime.now(datetime.timezone.utc)).total_seconds()
             return max(0.0, delta)
-    except Exception:
+    except Exception:  # noqa: BLE001
         pass
     return default
 
@@ -2462,7 +2449,7 @@ async def _raw_post(client, url, payload, headers, cookies):
                     f"[claim-raw] {res.status_code} {url} -> {res.text[:500]}",
                     flush=True,
                 )
-            except Exception:
+            except Exception:  # noqa: BLE001
                 pass
         return res, _safe_json(res)
 
@@ -2511,7 +2498,7 @@ async def _apply_cart(client, headers, cookies, cart_info, code):
             cookies=cookies or None,
         )
         return f"\nCart: `{res.status_code}` {res.text[:120]}"
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         return f"\nCart apply error: `{e}`"
 
 async def claim_slot_worker(client, chat_id, slot_id, token_data, code, carts_db, lockouts_db, specific_answer=None, deadline=None, start_delay=0.0):
@@ -2557,7 +2544,7 @@ async def claim_slot_worker(client, chat_id, slot_id, token_data, code, carts_db
             break
         try:
             res, body = await _hedged_post(client, url, payload, headers, cookies, HEDGE_REQUESTS)
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             res, body = None, {"message": str(e)}
 
         if res is not None:
@@ -2662,7 +2649,7 @@ async def execute_burner_test(chat_id, code):
             f"Status: `{res.status_code}`\n"
             f"Response: `{json.dumps(body)[:400]}`{cart_suffix}"
         )
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         return f"❌ Burner test error: {e}"
 
 # ---------------------------------------------------------------------------
@@ -2847,7 +2834,7 @@ async def _claim_and_report(chat_str, code, *, label="Personal Code Target", mir
     for fut in asyncio.as_completed(tasks):
         try:
             res = await fut
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             res = {"slot": "?", "status": 500, "response": {"message": str(e)}}
         if not isinstance(res, dict):
             continue
@@ -2959,7 +2946,7 @@ async def claim_code_global(raw_code, announce=True):
                         ),
                         notify_empty=not mirror,
                     )
-                except Exception as e:
+                except Exception as e:  # noqa: BLE001
                     print(f"[claim] admin target {c_str} error: {e}", flush=True)
 
             await asyncio.gather(*(run_admin(c) for c in targets))
@@ -3072,7 +3059,7 @@ async def handle_ai_answer_callback(cq_id, chat_id, msg_id, chat_str, action):
             f"✅ Submitting: `{answer}`",
             reply_markup=ai_answer_keyboard(code, answers, submitted=idx),
         )
-    except Exception:
+    except Exception:  # noqa: BLE001
         pass
     await handle_answer(chat_str, answer, entry)
 
@@ -3089,7 +3076,7 @@ async def worker():
             elif kind == "isolated":
                 c_str, code = payload
                 await claim_code_for_chat(c_str, code)
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             print(f"[worker] error: {e}", flush=True)
         finally:
             _code_queue.task_done()
@@ -3197,7 +3184,7 @@ def run_http_server():
     print(f"[http] listening on 0.0.0.0:{PORT}", flush=True)
     try:
         server.serve_forever()
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         print(f"[http] server stopped: {e}", flush=True)
 
 # ---------------------------------------------------------------------------
@@ -3848,7 +3835,7 @@ async def handle_photo_update(update, tg_client):
             await process_text_isolated(chat_str, extracted)
         else:
             await send_telegram(chat_id, "❌ No text found in that screenshot. Please send it as text.")
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         print(f"[photo] error: {e}", flush=True)
 
 async def telegram_poller():
@@ -3875,14 +3862,14 @@ async def telegram_poller():
                                 await handle_photo_update(update, tg_client)
                             elif "message" in update:
                                 await handle_text_update(update)
-                        except Exception as e:
+                        except Exception as e:  # noqa: BLE001
                             print(f"[tg] update error: {e}", flush=True)
                 elif res.status_code == 409:
                     print("[tg] 409 conflict - another poller/webhook is active.", flush=True)
                     await asyncio.sleep(5)
             except asyncio.CancelledError:
                 raise
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001
                 print(f"[tg] poller error: {e}", flush=True)
                 await asyncio.sleep(2)
             await asyncio.sleep(0.02)
